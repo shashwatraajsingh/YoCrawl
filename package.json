@@ -1,0 +1,31 @@
+{
+  "name": "yocrawl",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js",
+    "cli": "node cli.js",
+    "test": "node --test tests/"
+  },
+  "keywords": [
+    "ai",
+    "browser-agent",
+    "playwright",
+    "automation"
+  ],
+  "author": "",
+  "license": "ISC",
+  "description": "AI browser agent — LLM plans JSON actions, Playwright executes them.",
+  "dependencies": {
+    "@google/generative-ai": "^0.24.1",
+    "cors": "^2.8.6",
+    "dotenv": "^17.2.4",
+    "express": "^5.2.1",
+    "playwright": "^1.58.2",
+    "socket.io": "^4.8.3",
+    "uuid": "^13.0.0",
+    "winston": "^3.19.0"
+  }
+}
