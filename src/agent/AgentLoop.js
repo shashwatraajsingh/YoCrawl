@@ -10,6 +10,12 @@ import logger from '../logger.js';
  * Orchestrates the observe → plan → act loop.
  * Extends EventEmitter so the API layer can stream progress in real-time.
  *
+ * Improvements inspired by surf.new's browser_use agent:
+ * - Configurable step delay to avoid overwhelming pages
+ * - Retry logic for transient LLM errors
+ * - Better error classification and recovery
+ * - Session uptime enforcement
+ *
  * Events emitted:
  *   'step:start'    — { step, maxSteps }
  *   'step:observe'  — { step, pageContext }
@@ -29,6 +35,8 @@ export default class AgentLoop extends EventEmitter {
         this.history = [];
         this.status = 'idle';
         this.aborted = false;
+        this.consecutiveErrors = 0;
+        this.maxConsecutiveErrors = 3;
     }
 
     async run(taskDescription, startUrl) {
@@ -44,7 +52,7 @@ export default class AgentLoop extends EventEmitter {
             if (startUrl) {
                 await page.goto(startUrl, {
                     waitUntil: 'domcontentloaded',
-                    timeout: 15_000,
+                    timeout: config.browser.timeout,
                 });
             }
 
@@ -54,7 +62,8 @@ export default class AgentLoop extends EventEmitter {
             return report;
         } catch (error) {
             this.status = 'error';
-            this.emit('task:error', { error: error.message });
+            const classified = this.classifyError(error);
+            this.emit('task:error', { error: classified.message, type: classified.type });
             throw error;
         } finally {
             await this.session.close();
@@ -63,6 +72,7 @@ export default class AgentLoop extends EventEmitter {
 
     async loop() {
         const maxSteps = config.agent.maxSteps;
+        const stepDelay = config.agent.stepDelayMs;
 
         while (this.stepCount < maxSteps) {
             if (this.aborted) {
@@ -74,16 +84,50 @@ export default class AgentLoop extends EventEmitter {
             logger.info(`── Step ${this.stepCount}/${maxSteps} ──`);
             this.emit('step:start', { step: this.stepCount, maxSteps });
 
-            const pageContext = await this.contextExtractor.extract();
-            this.emit('step:observe', { step: this.stepCount, pageContext });
+            // --- OBSERVE ---
+            let pageContext;
+            try {
+                pageContext = await this.contextExtractor.extract();
+                this.emit('step:observe', { step: this.stepCount, pageContext });
+            } catch (err) {
+                logger.error('Failed to extract page context', { error: err.message });
+                // Page might have crashed or navigated unexpectedly — give it a beat
+                await this.sleep(1000);
+                continue;
+            }
 
+            // --- PLAN ---
             const previousResults = this.getLastResults();
+            let plan;
+            try {
+                plan = await this.planner.planNextActions(
+                    pageContext,
+                    this.stepCount,
+                    previousResults
+                );
+                // Successful plan resets the error counter
+                this.consecutiveErrors = 0;
+            } catch (err) {
+                this.consecutiveErrors++;
+                const classified = this.classifyError(err);
+                logger.error('Planner error', {
+                    type: classified.type,
+                    message: classified.message,
+                    attempt: this.consecutiveErrors,
+                });
 
-            const plan = await this.planner.planNextActions(
-                pageContext,
-                this.stepCount,
-                previousResults
-            );
+                if (this.consecutiveErrors >= this.maxConsecutiveErrors) {
+                    logger.error('Too many consecutive planner errors — aborting');
+                    return this.buildReport(
+                        `Agent stopped: ${this.consecutiveErrors} consecutive planner errors. Last: ${classified.message}`
+                    );
+                }
+
+                // Wait and retry the step
+                await this.sleep(2000);
+                this.stepCount--; // Don't count the failed attempt
+                continue;
+            }
 
             this.emit('step:plan', {
                 step: this.stepCount,
@@ -107,11 +151,17 @@ export default class AgentLoop extends EventEmitter {
                 continue;
             }
 
+            // --- ACT ---
             const results = await this.executor.executeBatch(plan.actions);
             this.history.push({ step: this.stepCount, plan, results });
             this.emit('step:act', { step: this.stepCount, results });
 
             this.planner.trimHistory();
+
+            // Step delay to let the page settle (inspired by surf.new's wait_time_between_steps)
+            if (stepDelay > 0) {
+                await this.sleep(stepDelay);
+            }
         }
 
         logger.warn('Max steps reached without completion');
@@ -133,9 +183,41 @@ export default class AgentLoop extends EventEmitter {
         return {
             task: 'complete',
             totalSteps: this.stepCount,
+            maxSteps: config.agent.maxSteps,
             result: finalResult,
             history: this.history,
+            browserUptime: this.session.getUptimeSeconds(),
         };
+    }
+
+    /**
+     * Classifies errors into categories (inspired by surf.new's error handling).
+     * Helps the frontend display appropriate messages and the agent decide whether to retry.
+     */
+    classifyError(error) {
+        const message = error.message || String(error);
+
+        if (message.includes('429') || message.includes('rate limit') || message.includes('quota')) {
+            return { type: 'RATE_LIMIT', message: `Rate limited: ${message}`, retryable: true };
+        }
+        if (message.includes('timeout') || message.includes('ETIMEDOUT')) {
+            return { type: 'TIMEOUT', message: `Request timed out: ${message}`, retryable: true };
+        }
+        if (message.includes('ECONNREFUSED') || message.includes('network')) {
+            return { type: 'NETWORK', message: `Network error: ${message}`, retryable: true };
+        }
+        if (message.includes('Invalid JSON') || message.includes('parse')) {
+            return { type: 'PARSE_ERROR', message: `Invalid response: ${message}`, retryable: true };
+        }
+        if (message.includes('API key') || message.includes('auth') || message.includes('401')) {
+            return { type: 'AUTH_ERROR', message: `Authentication error: ${message}`, retryable: false };
+        }
+
+        return { type: 'UNKNOWN', message, retryable: false };
+    }
+
+    sleep(ms) {
+        return new Promise((resolve) => setTimeout(resolve, ms));
     }
 
     toJSON() {
@@ -144,6 +226,7 @@ export default class AgentLoop extends EventEmitter {
             stepCount: this.stepCount,
             maxSteps: config.agent.maxSteps,
             historyLength: this.history.length,
+            consecutiveErrors: this.consecutiveErrors,
         };
     }
 }

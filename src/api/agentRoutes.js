@@ -15,7 +15,11 @@ router.post('/start', (req, res) => {
 
     if (!task || typeof task !== 'string') {
         return res.status(400).json({
-            error: 'Missing required field: "task" (string)',
+            error: {
+                message: 'Missing required field: "task" (string)',
+                type: 'ValidationError',
+                code: 400,
+            },
         });
     }
 
@@ -47,8 +51,16 @@ router.get('/:sessionId', (req, res) => {
     const session = sessionManager.getSession(req.params.sessionId);
 
     if (!session) {
-        return res.status(404).json({ error: 'Session not found' });
+        return res.status(404).json({
+            error: {
+                message: 'Session not found',
+                type: 'NotFoundError',
+                code: 404,
+            },
+        });
     }
+
+    const metrics = sessionManager.getSessionMetrics(req.params.sessionId);
 
     res.json({
         id: session.id,
@@ -61,7 +73,28 @@ router.get('/:sessionId', (req, res) => {
         steps: session.steps,
         report: session.report,
         error: session.error,
+        metrics,
     });
+});
+
+/**
+ * GET /api/agent/:sessionId/metrics
+ * Returns just the performance metrics for a session.
+ */
+router.get('/:sessionId/metrics', (req, res) => {
+    const metrics = sessionManager.getSessionMetrics(req.params.sessionId);
+
+    if (!metrics) {
+        return res.status(404).json({
+            error: {
+                message: 'Session not found',
+                type: 'NotFoundError',
+                code: 404,
+            },
+        });
+    }
+
+    res.json(metrics);
 });
 
 /**
@@ -72,7 +105,13 @@ router.post('/:sessionId/stop', (req, res) => {
     const stopped = sessionManager.stopSession(req.params.sessionId);
 
     if (!stopped) {
-        return res.status(404).json({ error: 'Session not found' });
+        return res.status(404).json({
+            error: {
+                message: 'Session not found',
+                type: 'NotFoundError',
+                code: 404,
+            },
+        });
     }
 
     res.json({ status: 'stopping', sessionId: req.params.sessionId });
@@ -80,13 +119,19 @@ router.post('/:sessionId/stop', (req, res) => {
 
 /**
  * DELETE /api/agent/:sessionId
- * Removes a session from the session manager.
+ * Removes a session from the session manager (similar to surf.new's release endpoint).
  */
 router.delete('/:sessionId', (req, res) => {
     const deleted = sessionManager.deleteSession(req.params.sessionId);
 
     if (!deleted) {
-        return res.status(404).json({ error: 'Session not found' });
+        return res.status(404).json({
+            error: {
+                message: 'Session not found',
+                type: 'NotFoundError',
+                code: 404,
+            },
+        });
     }
 
     res.json({ deleted: true, sessionId: req.params.sessionId });
@@ -94,7 +139,7 @@ router.delete('/:sessionId', (req, res) => {
 
 /**
  * GET /api/agent
- * Lists all sessions (active and completed).
+ * Lists all sessions (active and completed) with duration.
  */
 router.get('/', (_req, res) => {
     res.json({ sessions: sessionManager.listSessions() });
